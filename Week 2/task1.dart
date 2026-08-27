@@ -1,5 +1,11 @@
-void main() {
-  for (var i = 0; i < 10; i++) {
-    print('hello ${i + 1}');
+double average(List<int> values) {
+  int sum = 0;
+  for (int i = 0; i < values.length; i++) {
+    sum += values[i];
   }
+  return sum / values.length;
+}
+
+void main() {
+  print(average([10, 20, 30]));
 }
