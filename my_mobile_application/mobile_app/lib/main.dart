@@ -2,9 +2,15 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
+
+// Created for you by the `flutterfire configure` command.
+import 'firebase_options.dart';
 
 //wrestler model. The app keeps a list of wrestlers, each with a name, weight class, and record.
 class Wrestler {
@@ -37,6 +43,35 @@ class MatchResult {
 
   Wrestler get winner => redScore > greenScore ? red : green;
   Wrestler get loser => redScore > greenScore ? green : red;
+}
+
+// One forum post. Each post is a document in the top-level Firestore
+// collection "forum", so every logged-in user sees the same posts.
+class ForumPost {
+  final String id; // the Firestore document id
+  final String text;
+  final String author; // the part of the email before the @
+  final String uid; // who wrote it (used to allow deleting your own posts)
+  final DateTime createdAt;
+
+  ForumPost({
+    required this.id,
+    required this.text,
+    required this.author,
+    required this.uid,
+    required this.createdAt,
+  });
+
+  factory ForumPost.fromDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+    final Map<String, dynamic> data = doc.data();
+    return ForumPost(
+      id: doc.id,
+      text: data['text'] as String? ?? '',
+      author: data['author'] as String? ?? 'someone',
+      uid: data['uid'] as String? ?? '',
+      createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+    );
+  }
 }
 
 //Trivia question model. The API returns the correct answer and a list of wrong answers, which we combine and shuffle.
@@ -76,9 +111,141 @@ class TriviaQuestion {
 // The trivia screen shows one of four things depending on this status.
 enum TriviaStatus { loading, error, empty, data }
 
-// Provider model. Holds the roster, match history, scoreboard, clock, and trivia questions.
-//All screens read from this model and call its methods to change data.
+// The main model for the application, handling authentication, user data, and providing access to the Firestore database.
 class WrestlingModel extends ChangeNotifier {
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  StreamSubscription<User?>? _authSub;
+
+  // The model listens to login changes, so when someone logs in or out the
+  // forum stream switches on or off.
+  WrestlingModel() {
+    _authSub = _auth.authStateChanges().listen(_onAuthChanged);
+  }
+
+  // The current user's UID and email.
+  String? _uid;
+  String? _email;
+
+  String? get email => _email;
+
+  // Turns a Firebase error code into a message a person can read.
+  String _authMessage(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'invalid-email':
+        return 'That email address is not valid.';
+      case 'user-not-found':
+      case 'wrong-password':
+      case 'invalid-credential':
+        return 'Incorrect email or password.';
+      case 'user-disabled':
+        return 'This account has been disabled.';
+      case 'email-already-in-use':
+        return 'An account already exists for that email. Try logging in.';
+      case 'weak-password':
+        return 'That password is too weak. Use at least 6 characters.';
+      case 'network-request-failed':
+        return 'No internet connection. Check your network and try again.';
+      case 'too-many-requests':
+        return 'Too many attempts. Please wait a moment and try again.';
+      case 'operation-not-allowed':
+        return 'Email/password sign-in is not turned on in Firebase.';
+      default:
+        return 'Something went wrong (${e.code}). Please try again.';
+    }
+  }
+
+  // Each of these returns null on success, or a readable error message.
+  Future<String?> signUp(String email, String password) async {
+    try {
+      await _auth.createUserWithEmailAndPassword(
+        email: email.trim(),
+        password: password,
+      );
+      return null;
+    } on FirebaseAuthException catch (e) {
+      return _authMessage(e);
+    } catch (_) {
+      return 'Something went wrong. Please try again.';
+    }
+  }
+
+  Future<String?> signIn(String email, String password) async {
+    try {
+      await _auth.signInWithEmailAndPassword(
+        email: email.trim(),
+        password: password,
+      );
+      return null;
+    } on FirebaseAuthException catch (e) {
+      return _authMessage(e);
+    } catch (_) {
+      return 'Something went wrong. Please try again.';
+    }
+  }
+
+  Future<void> signOut() async {
+    await _auth.signOut();
+  }
+
+  // Runs whenever someone logs in or out.
+  void _onAuthChanged(User? user) {
+    _uid = user?.uid;
+    _email = user?.email;
+
+    if (user == null) {
+      _forumStream = Stream<List<ForumPost>>.empty();
+    } else {
+      // Newest posts first. snapshots() sends a new list whenever anyone
+      // adds or deletes a post.
+      _forumStream = _db
+          .collection('forum')
+          .orderBy('createdAt', descending: true)
+          .limit(100)
+          .snapshots()
+          .map((snap) => snap.docs.map(ForumPost.fromDoc).toList());
+    }
+    notifyListeners();
+  }
+
+  // Cloud data: forum posts.
+  // Created once per login (not on every rebuild).
+  Stream<List<ForumPost>> _forumStream = Stream<List<ForumPost>>.empty();
+  Stream<List<ForumPost>> get forumStream => _forumStream;
+
+  String? get uid => _uid;
+
+  // Executes a cloud write operation without waiting for it to complete.
+  // Errors are printed to the console.
+  void _fireAndForget(Future<dynamic> write) {
+    write.then<void>(
+      (_) {},
+      onError: (Object e) {
+        debugPrint('Cloud write failed: $e');
+      },
+    );
+  }
+
+  // Adds a post to the forum in the cloud.
+  void postMessage(String text) {
+    final String? uid = _uid;
+    if (uid == null) return;
+    final String author = (_email ?? 'someone').split('@').first;
+    _fireAndForget(
+      _db.collection('forum').add({
+        'text': text,
+        'author': author,
+        'uid': uid,
+        'createdAt': Timestamp.now(),
+      }),
+    );
+  }
+
+  // Deletes one of your own posts.
+  void deletePost(String id) {
+    _fireAndForget(_db.collection('forum').doc(id).delete());
+  }
+
   // The list of wrestlers in the roster.
   final List<Wrestler> _roster = [
     Wrestler(name: 'Sebastian Hutchinson', weight: 197, wins: 0, losses: 0),
@@ -361,9 +528,10 @@ class WrestlingModel extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Cleans up the stance drill timer when the model is disposed.
+  // Cleans up the timers and the login listener when the model is disposed.
   @override
   void dispose() {
+    _authSub?.cancel();
     _timer?.cancel();
     _stanceTimer?.cancel();
     super.dispose();
@@ -371,8 +539,11 @@ class WrestlingModel extends ChangeNotifier {
 }
 
 // This is the entry point of the application.
-// It initializes the WrestlingModel and runs the WrestlingApp widget.
-void main() {
+// It starts Firebase, then creates the WrestlingModel and runs the app.
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
   runApp(
     ChangeNotifierProvider(
       create: (context) => WrestlingModel(),
@@ -382,7 +553,7 @@ void main() {
 }
 
 // The main application widget.
-// It sets up the MaterialApp with the theme and home page.
+// It sets up the MaterialApp with the theme and the auth gate.
 class WrestlingApp extends StatelessWidget {
   const WrestlingApp({super.key});
 
@@ -395,7 +566,163 @@ class WrestlingApp extends StatelessWidget {
         colorSchemeSeed: const Color(0xFFB71C1C), // deep red
         fontFamily: 'Roboto',
       ),
-      home: const HomePage(),
+      home: const AuthGate(),
+    );
+  }
+}
+
+// The auth gate. It listens to Firebase and shows the app when someone is
+// logged in, or the login screen when nobody is.
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snapshot.hasData) {
+          return const HomePage();
+        }
+        return const LoginPage();
+      },
+    );
+  }
+}
+
+// The login / sign-up page.
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final TextEditingController emailController = TextEditingController();
+  final TextEditingController passwordController = TextEditingController();
+  bool isLogin = true; // false means sign-up mode
+  bool loading = false;
+  String? error;
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final String email = emailController.text.trim();
+    final String password = passwordController.text;
+
+    if (email.isEmpty || password.isEmpty) {
+      setState(() => error = 'Please enter your email and password.');
+      return;
+    }
+
+    setState(() {
+      loading = true;
+      error = null;
+    });
+
+    final WrestlingModel model = context.read<WrestlingModel>();
+    final String? problem = isLogin
+        ? await model.signIn(email, password)
+        : await model.signUp(email, password);
+
+    // When it works, the auth gate swaps this page for the app, so only
+    // update the screen if we are still here (meaning it failed).
+    if (!mounted) return;
+    setState(() {
+      loading = false;
+      error = problem;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.sports_mma, size: 64),
+                const SizedBox(height: 8),
+                const Text(
+                  'Wrestling App',
+                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 4),
+                Text(isLogin ? 'Log in to your account' : 'Create an account'),
+                const SizedBox(height: 24),
+                TextField(
+                  controller: emailController,
+                  keyboardType: TextInputType.emailAddress,
+                  decoration: const InputDecoration(
+                    labelText: 'Email',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: passwordController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Password',
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => loading ? null : _submit(),
+                ),
+                if (error != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Text(
+                      error!,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 20),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: loading ? null : _submit,
+                    child: loading
+                        ? const SizedBox(
+                            height: 20,
+                            width: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Text(isLogin ? 'Log in' : 'Create account'),
+                  ),
+                ),
+                TextButton(
+                  onPressed: loading
+                      ? null
+                      : () => setState(() {
+                          isLogin = !isLogin;
+                          error = null;
+                        }),
+                  child: Text(
+                    isLogin
+                        ? 'Need an account? Sign up'
+                        : 'Already have an account? Log in',
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -411,7 +738,17 @@ class HomePage extends StatelessWidget {
     final double screenWidth = MediaQuery.of(context).size.width;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Wrestling App'), centerTitle: true),
+      appBar: AppBar(
+        title: const Text('Wrestling App'),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Log out',
+            onPressed: () => _logout(context),
+          ),
+        ],
+      ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -547,6 +884,14 @@ Widget _bottomIcon(
 // Opens a page. Used by the ribbon buttons below.
 void _open(BuildContext context, Widget page) {
   Navigator.push(context, MaterialPageRoute(builder: (context) => page));
+}
+
+// Logs out the user. First closes all pages back to the first one, then signs out.
+Future<void> _logout(BuildContext context) async {
+  final NavigatorState navigator = Navigator.of(context);
+  final WrestlingModel model = context.read<WrestlingModel>();
+  navigator.popUntil((route) => route.isFirst);
+  await model.signOut();
 }
 
 Widget _buildBottomBar(BuildContext context) {
@@ -820,7 +1165,7 @@ class RosterPage extends StatelessWidget {
 }
 
 // The add wrestler page of the application.
-// It allows users to input a new wrestler's name and weight class, then save it to the model.
+// It allows users to input a new wrestler's name and weight class, then save it to the cloud.
 class AddWrestlerPage extends StatefulWidget {
   const AddWrestlerPage({super.key});
 
@@ -855,8 +1200,9 @@ class _AddWrestlerPageState extends State<AddWrestlerPage> {
   void _save() {
     final String name = nameController.text.trim();
     if (name.isEmpty) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Please enter a name.')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Please enter a name.')));
       return;
     }
     context.read<WrestlingModel>().addWrestler(name, selectedWeight);
@@ -1084,9 +1430,9 @@ class TriviaPage extends StatelessWidget {
               ? null
               : OutlinedButton.styleFrom(
                   disabledBackgroundColor: color.withValues(alpha: 0.2),
-                  disabledForegroundColor: Theme.of(context)
-                      .colorScheme
-                      .onSurface,
+                  disabledForegroundColor: Theme.of(
+                    context,
+                  ).colorScheme.onSurface,
                 ),
           child: Text(answer),
         ),
@@ -1281,7 +1627,7 @@ class StanceInMotionPage extends StatelessWidget {
   }
 }
 
-/// The events page of the application.
+// The events page of the application.
 class EventsPage extends StatelessWidget {
   const EventsPage({super.key});
 
@@ -1294,7 +1640,7 @@ class EventsPage extends StatelessWidget {
   }
 }
 
-/// The streak tracker page of the application.
+// The streak tracker page of the application.
 class StreakPage extends StatelessWidget {
   const StreakPage({super.key});
 
@@ -1307,28 +1653,171 @@ class StreakPage extends StatelessWidget {
   }
 }
 
-/// The forum page of the application.
-class ForumPage extends StatelessWidget {
+// Formats a post time like "11/12 8:09 PM".
+String _forumTime(DateTime t) {
+  final int hour12 = t.hour % 12 == 0 ? 12 : t.hour % 12;
+  final String minute = t.minute.toString().padLeft(2, '0');
+  final String ampm = t.hour >= 12 ? 'PM' : 'AM';
+  return '${t.month}/${t.day} $hour12:$minute $ampm';
+}
+
+// The forum page of the application.
+// Posts are stored in Firestore (collection "forum") and shared by all users.
+class ForumPage extends StatefulWidget {
   const ForumPage({super.key});
 
   @override
+  State<ForumPage> createState() => _ForumPageState();
+}
+
+class _ForumPageState extends State<ForumPage> {
+  final TextEditingController controller = TextEditingController();
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  void _send() {
+    final String text = controller.text.trim();
+    if (text.isEmpty) return;
+    context.read<WrestlingModel>().postMessage(text);
+    controller.clear();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final WrestlingModel model = context.watch<WrestlingModel>();
+
     return Scaffold(
       appBar: AppBar(title: const Text('Forum')),
-      body: const Center(child: Text('Forum coming soon')),
+      body: Column(
+        children: [
+          Expanded(
+            child: StreamBuilder<List<ForumPost>>(
+              stream: model.forumStream,
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text("Couldn't load the forum.\n${snapshot.error}"),
+                    ),
+                  );
+                }
+                if (!snapshot.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+
+                final List<ForumPost> posts = snapshot.data!;
+                if (posts.isEmpty) {
+                  return const Center(
+                    child: Text('No posts yet. Start the conversation!'),
+                  );
+                }
+
+                return ListView.builder(
+                  itemCount: posts.length,
+                  itemBuilder: (context, index) {
+                    final ForumPost post = posts[index];
+                    final bool mine = post.uid == model.uid;
+                    return ListTile(
+                      leading: CircleAvatar(
+                        child: Text(
+                          post.author.isEmpty
+                              ? '?'
+                              : post.author[0].toUpperCase(),
+                        ),
+                      ),
+                      title: Text(post.text),
+                      subtitle: Text(
+                        '${post.author} · ${_forumTime(post.createdAt)}',
+                      ),
+                      // Only your own posts get a delete button.
+                      trailing: mine
+                          ? IconButton(
+                              icon: const Icon(Icons.delete_outline),
+                              tooltip: 'Delete post',
+                              onPressed: () => context
+                                  .read<WrestlingModel>()
+                                  .deletePost(post.id),
+                            )
+                          : null,
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          // The box at the bottom for writing a new post.
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: controller,
+                      maxLength: 500,
+                      textCapitalization: TextCapitalization.sentences,
+                      decoration: const InputDecoration(
+                        hintText: 'Write a post...',
+                        border: OutlineInputBorder(),
+                        counterText: '',
+                      ),
+                      onSubmitted: (_) => _send(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filled(
+                    icon: const Icon(Icons.send),
+                    tooltip: 'Post',
+                    onPressed: _send,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
-/// The account settings page of the application.
+// The account settings page of the application.
+// It shows who is logged in and has the Log out button.
 class AccountPage extends StatelessWidget {
   const AccountPage({super.key});
 
   @override
   Widget build(BuildContext context) {
+    final WrestlingModel model = context.watch<WrestlingModel>();
+
     return Scaffold(
       appBar: AppBar(title: const Text('Account Settings')),
-      body: const Center(child: Text('Account settings coming soon')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Signed in as'),
+            Text(
+              model.email ?? 'Unknown',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 24),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () => _logout(context),
+                icon: const Icon(Icons.logout),
+                label: const Text('Log out'),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
